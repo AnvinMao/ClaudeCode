@@ -6,7 +6,7 @@ import { MermaidRenderer } from '../chat/MermaidRenderer'
 
 type Props = {
   content: string
-  variant?: 'default' | 'document'
+  variant?: 'default' | 'document' | 'compact'
   className?: string
 }
 
@@ -105,13 +105,13 @@ function parseMarkdown(content: string): { html: string; codeBlocks: CodeBlock[]
   return { html, codeBlocks }
 }
 
-const BASE_PROSE_CLASSES = `markdown-prose prose prose-sm max-w-none text-[var(--color-text-primary)]
+const BASE_PROSE_CLASSES = `markdown-prose prose prose-sm min-w-0 max-w-none break-words [overflow-wrap:anywhere] text-[var(--color-text-primary)]
   prose-headings:text-[var(--color-text-primary)] prose-headings:font-semibold
   prose-p:my-2 prose-p:leading-relaxed
-  prose-p:break-words
+  prose-p:break-words prose-p:[overflow-wrap:anywhere]
   prose-code:text-[13px] prose-code:text-[var(--color-code-fg)] prose-code:font-[var(--font-mono)] prose-code:bg-[var(--color-code-bg)] prose-code:border prose-code:border-[var(--color-border)] prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-code:before:hidden prose-code:after:hidden
   prose-pre:!bg-transparent prose-pre:!p-0 prose-pre:!shadow-none
-  prose-a:text-[var(--color-text-accent)] prose-a:no-underline hover:prose-a:underline
+  prose-a:text-[var(--color-text-accent)] prose-a:no-underline prose-a:[overflow-wrap:anywhere] hover:prose-a:underline
   prose-strong:text-[var(--color-text-primary)]
   prose-ul:my-2 prose-ol:my-2
   prose-li:my-0.5
@@ -136,8 +136,24 @@ const DOCUMENT_PROSE_CLASSES = `
   prose-li:my-1.5
   prose-table:my-0`
 
-function getProseClasses(variant: 'default' | 'document', className?: string) {
-  return [BASE_PROSE_CLASSES, variant === 'document' ? DOCUMENT_PROSE_CLASSES : '', className ?? '']
+const COMPACT_PROSE_CLASSES = `
+  prose-p:my-1 prose-p:text-xs prose-p:leading-5 prose-p:text-[var(--color-text-secondary)]
+  prose-headings:mt-2 prose-headings:mb-1 prose-headings:leading-snug
+  prose-h1:text-base prose-h2:text-sm prose-h3:text-xs prose-h4:text-xs
+  prose-blockquote:my-2 prose-blockquote:border-l-2 prose-blockquote:border-[var(--color-outline-variant)] prose-blockquote:pl-3 prose-blockquote:text-[var(--color-text-secondary)]
+  prose-code:text-[12px]
+  prose-ul:my-1 prose-ol:my-1 prose-ul:pl-4 prose-ol:pl-4
+  prose-li:my-0.5 prose-li:text-xs prose-li:leading-5 prose-li:text-[var(--color-text-secondary)]
+  prose-table:text-xs
+  [&_.md-table-wrap]:my-2`
+
+function getProseClasses(variant: 'default' | 'document' | 'compact', className?: string) {
+  return [
+    BASE_PROSE_CLASSES,
+    variant === 'document' ? DOCUMENT_PROSE_CLASSES : '',
+    variant === 'compact' ? COMPACT_PROSE_CLASSES : '',
+    className ?? '',
+  ]
     .filter(Boolean)
     .join(' ')
 }

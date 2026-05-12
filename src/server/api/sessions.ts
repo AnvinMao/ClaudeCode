@@ -10,6 +10,7 @@
  *   GET    /api/sessions/:id/turn-checkpoints — 获取按轮次保留的 checkpoint 预览
  *   GET    /api/sessions/:id/turn-checkpoints/diff — 获取绑定到指定 checkpoint 的 diff
  *   POST   /api/sessions            — 创建新会话
+ *   POST   /api/sessions/batch-delete — 批量删除会话
  *   DELETE /api/sessions/:id        — 删除会话
  *   PATCH  /api/sessions/:id        — 重命名会话
  */
@@ -17,10 +18,14 @@
 import { sessionService } from '../services/sessionService.js'
 import { conversationService } from '../services/conversationService.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
-import { getSlashCommands } from '../ws/handler.js'
+import { closeSessionConnection, getSlashCommands } from '../ws/handler.js'
 import { getCommandName } from '../../commands.js'
 import { getSkillDirCommands } from '../../skills/loadSkillsDir.js'
 import { WorkspaceService } from '../services/workspaceService.js'
+import {
+  getRepositoryContext,
+  type CreateSessionRepositoryOptions,
+} from '../services/repositoryLaunchService.js'
 import {
   executeSessionRewind,
   getSessionTurnCheckpointDiff,
@@ -28,6 +33,7 @@ import {
   previewSessionRewind,
   type RewindTargetSelector,
 } from '../services/sessionRewindService.js'
+import { SessionStore } from '../../../adapters/common/session-store.js'
 
 const workspaceService = new WorkspaceService(
   async (sessionId) => (
@@ -65,9 +71,25 @@ export async function handleSessionsApi(
       }
     }
 
+    // Special collection route: /api/sessions/batch-delete
+    if (sessionId === 'batch-delete') {
+      if (req.method !== 'POST') {
+        return Response.json(
+          { error: 'METHOD_NOT_ALLOWED', message: `Method ${req.method} not allowed` },
+          { status: 405 }
+        )
+      }
+      return await batchDeleteSessions(req)
+    }
+
     // Special collection route: /api/sessions/recent-projects
     if (sessionId === 'recent-projects' && req.method === 'GET') {
       return await getRecentProjects(url)
+    }
+
+    // Special collection route: /api/sessions/repository-context
+    if (sessionId === 'repository-context' && req.method === 'GET') {
+      return await getSessionRepositoryContext(url)
     }
 
     // -----------------------------------------------------------------------
@@ -244,9 +266,9 @@ async function handleSessionWorkspaceRoute(
 }
 
 async function createSession(req: Request): Promise<Response> {
-  let body: { workDir?: string }
+  let body: { workDir?: string; repository?: CreateSessionRepositoryOptions }
   try {
-    body = (await req.json()) as { workDir?: string }
+    body = (await req.json()) as { workDir?: string; repository?: CreateSessionRepositoryOptions }
   } catch {
     throw ApiError.badRequest('Invalid JSON body')
   }
@@ -255,8 +277,30 @@ async function createSession(req: Request): Promise<Response> {
     throw ApiError.badRequest('workDir must be a string')
   }
 
-  const result = await sessionService.createSession(body.workDir)
+  if (body.repository !== undefined) {
+    if (!body.repository || typeof body.repository !== 'object' || Array.isArray(body.repository)) {
+      throw ApiError.badRequest('repository must be an object')
+    }
+    if (body.repository.branch !== undefined && body.repository.branch !== null && typeof body.repository.branch !== 'string') {
+      throw ApiError.badRequest('repository.branch must be a string')
+    }
+    if (body.repository.worktree !== undefined && typeof body.repository.worktree !== 'boolean') {
+      throw ApiError.badRequest('repository.worktree must be a boolean')
+    }
+  }
+
+  const result = await sessionService.createSession(body.workDir, body.repository)
+  recentProjectsCache = null
   return Response.json(result, { status: 201 })
+}
+
+async function getSessionRepositoryContext(url: URL): Promise<Response> {
+  const workDir = url.searchParams.get('workDir')
+  if (!workDir) {
+    throw ApiError.badRequest('workDir query parameter is required')
+  }
+
+  return Response.json(await getRepositoryContext(workDir))
 }
 
 async function requireSessionWorkspace(sessionId: string): Promise<string> {
@@ -322,7 +366,64 @@ async function deleteSession(sessionId: string): Promise<Response> {
     conversationService.unmarkSessionDeleted(sessionId)
     throw error
   }
+  closeSessionConnection(sessionId, 'session deleted')
+  cleanupAdapterSessionMappings(sessionId)
   return Response.json({ ok: true })
+}
+
+async function batchDeleteSessions(req: Request): Promise<Response> {
+  let body: { sessionIds?: unknown }
+  try {
+    body = (await req.json()) as { sessionIds?: unknown }
+  } catch {
+    throw ApiError.badRequest('Invalid JSON body')
+  }
+
+  const sessionIds = normalizeSessionIds(body.sessionIds)
+  conversationService.markSessionsDeleted(sessionIds)
+  const result = await sessionService.deleteSessions(sessionIds)
+
+  if (result.failures.length > 0) {
+    conversationService.unmarkSessionsDeleted(result.failures.map((failure) => failure.sessionId))
+  }
+
+  for (const sessionId of result.successes) {
+    closeSessionConnection(sessionId, 'session deleted')
+    cleanupAdapterSessionMappings(sessionId)
+  }
+
+  return Response.json({
+    ok: result.failures.length === 0,
+    successes: result.successes,
+    failures: result.failures,
+  })
+}
+
+function normalizeSessionIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    throw ApiError.badRequest('sessionIds must be an array')
+  }
+
+  const sessionIds: string[] = []
+  for (const sessionId of value) {
+    if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+      throw ApiError.badRequest('sessionIds must contain only non-empty strings')
+    }
+    sessionIds.push(sessionId.trim())
+  }
+
+  if (sessionIds.length === 0) {
+    throw ApiError.badRequest('sessionIds must include at least one session id')
+  }
+
+  return [...new Set(sessionIds)]
+}
+
+function cleanupAdapterSessionMappings(sessionId: string): void {
+  const removedChatIds = new SessionStore().deleteBySessionId(sessionId)
+  if (removedChatIds.length > 0) {
+    console.log(`[Sessions API] Removed ${removedChatIds.length} adapter session mapping(s) for ${sessionId}`)
+  }
 }
 
 async function getSessionSlashCommands(sessionId: string): Promise<Response> {
@@ -493,10 +594,27 @@ function chooseRicherUsage(
 }
 
 async function getGitInfo(sessionId: string): Promise<Response> {
-  const workDir = await sessionService.getSessionWorkDir(sessionId)
+  const workDir = conversationService.getSessionWorkDir(sessionId) || await sessionService.getSessionWorkDir(sessionId)
   if (!workDir) {
     throw ApiError.notFound(`Session not found: ${sessionId}`)
   }
+  const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
+  const repository = launchInfo?.repository
+  const worktreeSession = launchInfo?.worktreeSession
+  // The visible business branch comes from Desktop's launch choice when present.
+  // CLI originalBranch is the source checkout before creating the worktree, which
+  // can differ from the selected base ref.
+  const sessionBranch = repository?.branch || worktreeSession?.originalBranch || null
+  const worktree = repository?.worktree || worktreeSession
+    ? {
+        enabled: true,
+        path: worktreeSession?.worktreePath || workDir,
+        plannedPath: worktreeSession?.worktreePath || repository?.worktreePath || null,
+        sourceWorkDir: worktreeSession?.originalCwd || repository?.requestedWorkDir || repository?.repoRoot || null,
+        slug: worktreeSession?.worktreeName || repository?.worktreeSlug || null,
+        branch: worktreeSession?.worktreeBranch || repository?.worktreeBranch || null,
+      }
+    : null
 
   try {
     // Get branch name
@@ -506,7 +624,7 @@ async function getGitInfo(sessionId: string): Promise<Response> {
       stderr: 'pipe',
     })
     const branchText = await new Response(branchProc.stdout).text()
-    const branch = branchText.trim()
+    const branch = sessionBranch || branchText.trim()
 
     // Get repo name from remote or directory
     let repoName = ''
@@ -541,14 +659,16 @@ async function getGitInfo(sessionId: string): Promise<Response> {
       repoName,
       workDir,
       changedFiles,
+      worktree,
     })
   } catch {
     // Not a git repo or git not available
     return Response.json({
-      branch: null,
+      branch: sessionBranch,
       repoName: null,
       workDir,
       changedFiles: 0,
+      worktree,
     })
   }
 }
@@ -640,6 +760,18 @@ type RecentProjectEntry = {
 // In-memory cache for recent projects (TTL: 30s)
 let recentProjectsCache: { projects: RecentProjectEntry[]; timestamp: number } | null = null
 const RECENT_PROJECTS_CACHE_TTL = 30_000
+const DESKTOP_WORKTREE_MARKER = '/.claude/worktrees/'
+
+function projectNameForRecentPath(realPath: string, fallback: string): string {
+  const displayRoot = realPath.includes(DESKTOP_WORKTREE_MARKER)
+    ? realPath.slice(0, realPath.indexOf(DESKTOP_WORKTREE_MARKER))
+    : realPath
+  return displayRoot.split('/').filter(Boolean).pop() || fallback
+}
+
+function isDesktopWorktreeBranchName(branch: string | null): boolean {
+  return !!branch && branch.startsWith('worktree-desktop-')
+}
 
 async function getRecentProjects(url: URL): Promise<Response> {
   const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '10', 10) || 10, 1), 500)
@@ -680,7 +812,7 @@ async function getRecentProjects(url: URL): Promise<Response> {
   const entries = Array.from(realPathMap.entries())
   const projects = await Promise.all(
     entries.map(async ([realPath, info]) => {
-      const projectName = realPath.split('/').filter(Boolean).pop() || info.projectPath
+      const projectName = projectNameForRecentPath(realPath, info.projectPath)
 
       let isGit = false
       let repoName: string | null = null
@@ -712,7 +844,7 @@ async function getRecentProjects(url: URL): Promise<Response> {
               } catch { return null }
             })(),
           ])
-          branch = branchResult
+          branch = isDesktopWorktreeBranchName(branchResult) ? null : branchResult
           repoName = remoteResult
         }
       } catch { /* not a git repo or dir doesn't exist */ }

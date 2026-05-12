@@ -1,4 +1,6 @@
 import { useState, useEffect, useMemo, useRef, type ReactNode } from 'react'
+import QRCode from 'qrcode'
+import { Copy, Eye, EyeOff, PowerOff, QrCode, RotateCw } from 'lucide-react'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useProviderStore } from '../stores/providerStore'
 import { useTranslation } from '../i18n'
@@ -26,6 +28,7 @@ import { ComputerUseSettings } from './ComputerUseSettings'
 import { McpSettings } from './McpSettings'
 import { TerminalSettings } from './TerminalSettings'
 import { DiagnosticsSettings } from './DiagnosticsSettings'
+import { ActivitySettings } from './ActivitySettings'
 import { useUIStore, type SettingsTab } from '../stores/uiStore'
 import { ClaudeOfficialLogin } from '../components/settings/ClaudeOfficialLogin'
 import { useUpdateStore } from '../stores/updateStore'
@@ -44,6 +47,24 @@ import {
   restoreSettingsJsonSecrets,
   stripProviderSettingsJsonEnv,
 } from '../lib/providerSettingsJson'
+import { copyTextToClipboard } from '../components/chat/clipboard'
+
+function buildH5LaunchUrl(baseUrl: string | null, token: string | null): string | null {
+  if (!baseUrl) return null
+
+  try {
+    const url = new URL(baseUrl)
+    if (token) {
+      url.searchParams.set('serverUrl', baseUrl)
+      url.searchParams.set('h5Token', token)
+    }
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return token
+      ? `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}serverUrl=${encodeURIComponent(baseUrl)}&h5Token=${encodeURIComponent(token)}`
+      : baseUrl
+  }
+}
 
 export function Settings() {
   const [activeTab, setActiveTab] = useState<SettingsTab>('providers')
@@ -72,6 +93,7 @@ export function Settings() {
             <TabButton icon="auto_awesome" label={t('settings.tab.skills')} active={activeTab === 'skills'} onClick={() => setActiveTab('skills')} />
             <TabButton icon="extension" label={t('settings.tab.plugins')} active={activeTab === 'plugins'} onClick={() => setActiveTab('plugins')} />
             <TabButton icon="mouse" label={t('settings.tab.computerUse')} active={activeTab === 'computerUse'} onClick={() => setActiveTab('computerUse')} />
+            <TabButton icon="monitoring" label={t('settings.tab.activity')} active={activeTab === 'activity'} onClick={() => setActiveTab('activity')} />
             <TabButton icon="monitor_heart" label={t('settings.tab.diagnostics')} active={activeTab === 'diagnostics'} onClick={() => setActiveTab('diagnostics')} />
           </div>
           <div className="border-t border-[var(--color-border)]/40 pt-1">
@@ -83,6 +105,7 @@ export function Settings() {
         <div className="flex-1 overflow-y-auto px-8 py-6">
           {activeTab === 'providers' && <ProviderSettings />}
           {activeTab === 'permissions' && <PermissionSettings />}
+          {activeTab === 'activity' && <ActivitySettings />}
           {activeTab === 'general' && <GeneralSettings />}
           {activeTab === 'adapters' && <AdapterSettings />}
           {activeTab === 'terminal' && <TerminalSettings />}
@@ -1355,16 +1378,62 @@ function GeneralSettings() {
     setDesktopNotificationsEnabled,
     webSearch,
     setWebSearch,
+    h5Access,
+    h5AccessError,
+    enableH5Access,
+    disableH5Access,
+    regenerateH5AccessToken,
+    updateH5AccessSettings,
+    responseLanguage,
+    setResponseLanguage,
   } = useSettingsStore()
   const t = useTranslation()
   const [webSearchDraft, setWebSearchDraft] = useState(webSearch)
+  const [h5PublicBaseUrlDraft, setH5PublicBaseUrlDraft] = useState(h5Access.publicBaseUrl ?? '')
+  const [h5GeneratedToken, setH5GeneratedToken] = useState<string | null>(null)
+  const [h5TokenVisible, setH5TokenVisible] = useState(false)
+  const [h5EnableConfirmOpen, setH5EnableConfirmOpen] = useState(false)
+  const [h5QrDataUrl, setH5QrDataUrl] = useState<string | null>(null)
   const [notificationPermission, setNotificationPermission] = useState<DesktopNotificationPermission>('default')
   const [notificationActionRunning, setNotificationActionRunning] = useState(false)
+  const [h5ActionRunning, setH5ActionRunning] = useState(false)
   const webSearchDirty = JSON.stringify(webSearchDraft) !== JSON.stringify(webSearch)
+  const h5AccessUrl = h5Access.publicBaseUrl
+  const h5LaunchUrl = useMemo(
+    () => buildH5LaunchUrl(h5AccessUrl, h5GeneratedToken),
+    [h5AccessUrl, h5GeneratedToken],
+  )
+  const h5AccessDirty = h5PublicBaseUrlDraft.trim() !== (h5Access.publicBaseUrl ?? '')
 
   useEffect(() => {
     setWebSearchDraft(webSearch)
   }, [webSearch])
+
+  useEffect(() => {
+    setH5PublicBaseUrlDraft(h5Access.publicBaseUrl ?? '')
+  }, [h5Access])
+
+  useEffect(() => {
+    let cancelled = false
+    if (!h5Access.enabled || !h5LaunchUrl || !h5GeneratedToken) {
+      setH5QrDataUrl(null)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    QRCode.toDataURL(h5LaunchUrl, { margin: 1, width: 192 })
+      .then((dataUrl) => {
+        if (!cancelled) setH5QrDataUrl(dataUrl)
+      })
+      .catch(() => {
+        if (!cancelled) setH5QrDataUrl(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [h5Access.enabled, h5LaunchUrl, h5GeneratedToken])
 
   useEffect(() => {
     let cancelled = false
@@ -1387,6 +1456,33 @@ function GeneralSettings() {
     { value: 'en', label: 'English' },
     { value: 'zh', label: '中文' },
   ]
+
+  const RESPONSE_LANGUAGES: Array<{ value: string; label: string }> = [
+    { value: '', label: t('settings.general.responseLangDefault') },
+    { value: 'english', label: 'English' },
+    { value: 'chinese', label: '中文 (Chinese)' },
+    { value: 'japanese', label: '日本語 (Japanese)' },
+    { value: 'korean', label: '한국어 (Korean)' },
+    { value: 'spanish', label: 'Español (Spanish)' },
+    { value: 'french', label: 'Français (French)' },
+    { value: 'german', label: 'Deutsch (German)' },
+    { value: 'portuguese', label: 'Português (Portuguese)' },
+    { value: 'italian', label: 'Italiano (Italian)' },
+    { value: 'russian', label: 'Русский (Russian)' },
+    { value: 'dutch', label: 'Nederlands (Dutch)' },
+    { value: 'polish', label: 'Polski (Polish)' },
+    { value: 'turkish', label: 'Türkçe (Turkish)' },
+    { value: 'hindi', label: 'हिन्दी (Hindi)' },
+    { value: 'indonesian', label: 'Bahasa Indonesia' },
+    { value: 'ukrainian', label: 'Українська (Ukrainian)' },
+    { value: 'greek', label: 'Ελληνικά (Greek)' },
+    { value: 'czech', label: 'Čeština (Czech)' },
+    { value: 'danish', label: 'Dansk (Danish)' },
+    { value: 'swedish', label: 'Svenska (Swedish)' },
+    { value: 'norwegian', label: 'Norsk (Norwegian)' },
+  ]
+  const selectedResponseLanguageLabel =
+    RESPONSE_LANGUAGES.find(({ value }) => value === responseLanguage)?.label ?? RESPONSE_LANGUAGES[0]!.label
 
   const THEMES: Array<{ value: ThemeMode; label: string }> = [
     { value: 'light', label: t('settings.general.appearance.light') },
@@ -1453,6 +1549,60 @@ function GeneralSettings() {
     }
   }
 
+  const runH5Action = async (action: () => Promise<void>) => {
+    setH5ActionRunning(true)
+    try {
+      await action()
+    } catch {
+      // The store owns H5-specific error state.
+    } finally {
+      setH5ActionRunning(false)
+    }
+  }
+
+  const handleH5SettingsSave = async () => {
+    await runH5Action(async () => {
+      await updateH5AccessSettings({
+        publicBaseUrl: h5PublicBaseUrlDraft.trim() || null,
+      })
+    })
+  }
+
+  const handleH5UrlCopy = async () => {
+    if (!h5AccessUrl) return
+    await copyTextToClipboard(h5AccessUrl)
+  }
+
+  const handleH5LaunchUrlCopy = async () => {
+    if (!h5LaunchUrl) return
+    await copyTextToClipboard(h5LaunchUrl)
+  }
+
+  const handleH5EnableConfirm = async () => {
+    await runH5Action(async () => {
+      const token = await enableH5Access()
+      setH5GeneratedToken(token)
+      setH5TokenVisible(false)
+      setH5EnableConfirmOpen(false)
+    })
+  }
+
+  const handleH5Disable = async () => {
+    await runH5Action(async () => {
+      await disableH5Access()
+      setH5GeneratedToken(null)
+      setH5TokenVisible(false)
+    })
+  }
+
+  const handleH5Regenerate = async () => {
+    await runH5Action(async () => {
+      const token = await regenerateH5AccessToken()
+      setH5GeneratedToken(token)
+      setH5TokenVisible(false)
+    })
+  }
+
   return (
     <div className="max-w-xl">
       {/* Appearance selector */}
@@ -1493,6 +1643,28 @@ function GeneralSettings() {
         ))}
       </div>
 
+      {/* Response Language */}
+      <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.responseLangTitle')}</h2>
+      <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.responseLangDescription')}</p>
+      <Dropdown<string>
+        items={RESPONSE_LANGUAGES}
+        value={responseLanguage}
+        onChange={(value) => void setResponseLanguage(value)}
+        width="100%"
+        maxHeight={320}
+        className="mb-8 block w-full"
+        trigger={
+          <button
+            type="button"
+            aria-label={t('settings.general.responseLangTitle')}
+            className="flex h-10 w-full items-center gap-3 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 text-left text-sm text-[var(--color-text-primary)] outline-none transition-colors hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-container-low)] focus-visible:border-[var(--color-border-focus)] focus-visible:shadow-[var(--shadow-focus-ring)]"
+          >
+            <span className="min-w-0 flex-1 truncate">{selectedResponseLanguageLabel}</span>
+            <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">expand_more</span>
+          </button>
+        }
+      />
+
       {/* Effort Level */}
       <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.effortTitle')}</h2>
       <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.effortDescription')}</p>
@@ -1521,8 +1693,9 @@ function GeneralSettings() {
             aria-label={t('settings.general.thinkingEnabled')}
             checked={thinkingEnabled}
             onChange={(e) => void setThinkingEnabled(e.target.checked)}
-            className="mt-0.5 h-4 w-4 rounded border-[var(--color-border)] text-[var(--color-brand)] focus:ring-[var(--color-brand)]"
+            className="peer sr-only"
           />
+          <SettingsCheckboxMark checked={thinkingEnabled} />
           <div className="min-w-0">
             <div className="text-sm font-medium text-[var(--color-text-primary)]">
               {t('settings.general.thinkingEnabled')}
@@ -1544,8 +1717,9 @@ function GeneralSettings() {
               aria-label={t('settings.general.notificationsEnabled')}
               checked={desktopNotificationsEnabled}
               onChange={(e) => void handleDesktopNotificationsToggle(e.target.checked)}
-              className="mt-0.5 h-4 w-4 rounded border-[var(--color-border)] text-[var(--color-brand)] focus:ring-[var(--color-brand)]"
+              className="peer sr-only"
             />
+            <SettingsCheckboxMark checked={desktopNotificationsEnabled} />
             <div className="min-w-0 flex-1">
               <div className="text-sm font-medium text-[var(--color-text-primary)]">
                 {t('settings.general.notificationsEnabled')}
@@ -1589,8 +1763,9 @@ function GeneralSettings() {
             aria-label={t('settings.general.webFetchPreflightEnabled')}
             checked={skipWebFetchPreflight}
             onChange={(e) => void setSkipWebFetchPreflight(e.target.checked)}
-            className="mt-0.5 h-4 w-4 rounded border-[var(--color-border)] text-[var(--color-brand)] focus:ring-[var(--color-brand)]"
+            className="peer sr-only"
           />
+          <SettingsCheckboxMark checked={skipWebFetchPreflight} />
           <div className="min-w-0">
             <div className="text-sm font-medium text-[var(--color-text-primary)]">
               {t('settings.general.webFetchPreflightEnabled')}
@@ -1694,7 +1869,237 @@ function GeneralSettings() {
           </div>
         </div>
       </div>
+
+      <div className="mt-8">
+        <section aria-labelledby="general-h5-access-title" role="region">
+          <h2
+            id="general-h5-access-title"
+            className="text-base font-semibold text-[var(--color-text-primary)] mb-1"
+          >
+            {t('settings.general.h5AccessTitle')}
+          </h2>
+          <p className="text-sm text-[var(--color-text-tertiary)] mb-3">
+            {t('settings.general.h5AccessDescription')}
+          </p>
+          <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+            <div className="flex items-start justify-between gap-4">
+              <label className="flex min-w-0 items-start gap-3">
+                <input
+                  type="checkbox"
+                  className="mt-1 h-4 w-4 rounded border-[var(--color-border)] accent-[var(--color-primary)]"
+                  checked={h5Access.enabled}
+                  disabled={h5ActionRunning}
+                  aria-label={t('settings.general.h5AccessEnabled')}
+                  onChange={(event) => {
+                    if (event.target.checked) {
+                      setH5EnableConfirmOpen(true)
+                    } else {
+                      void handleH5Disable()
+                    }
+                  }}
+                />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-[var(--color-text-primary)]">
+                    {t('settings.general.h5AccessEnabled')}
+                  </span>
+                  <span className="mt-1 block text-xs leading-5 text-[var(--color-text-tertiary)]">
+                    {t('settings.general.h5AccessEnabledHint')}
+                  </span>
+                </span>
+              </label>
+              <span
+                className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${
+                  h5Access.enabled
+                    ? 'bg-[var(--color-success)]/10 text-[var(--color-success)]'
+                    : 'bg-[var(--color-surface)] text-[var(--color-text-tertiary)] border border-[var(--color-border)]'
+                }`}
+              >
+                {h5Access.enabled ? t('settings.general.h5AccessStatusEnabled') : t('settings.general.h5AccessDisabledValue')}
+              </span>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 gap-3">
+              <Input
+                id="h5-access-public-url"
+                label={t('settings.general.h5AccessPublicUrl')}
+                value={h5PublicBaseUrlDraft}
+                placeholder={t('settings.general.h5AccessPublicUrlPlaceholder')}
+                onChange={(event) => setH5PublicBaseUrlDraft(event.target.value)}
+              />
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-xs text-[var(--color-text-tertiary)]">
+                  {t('settings.general.h5AccessOpenHint')}
+                </p>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => void handleH5SettingsSave()}
+                  disabled={!h5AccessDirty || h5ActionRunning}
+                  aria-label={t('settings.general.h5AccessSave')}
+                >
+                  {t('settings.general.h5AccessSave')}
+                </Button>
+              </div>
+            </div>
+
+            {h5AccessUrl && (
+              <div className="mt-4 border-t border-[var(--color-border)]/60 pt-4">
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs uppercase tracking-[0.08em] text-[var(--color-text-tertiary)]">
+                      {t('settings.general.h5AccessUrl')}
+                    </div>
+                    <div className="mt-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-text-primary)] break-all">
+                      {h5AccessUrl}
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="shrink-0"
+                    icon={<Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+                    aria-label={t('settings.general.h5AccessCopyUrl')}
+                    onClick={() => void handleH5UrlCopy()}
+                  >
+                    {t('settings.general.h5AccessCopy')}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {h5Access.enabled && h5AccessUrl && (
+              <div className="mt-4 border-t border-[var(--color-border)]/60 pt-4">
+                <div className="flex flex-col gap-4 sm:flex-row">
+                  <div className="flex h-48 w-48 shrink-0 items-center justify-center rounded-lg border border-[var(--color-border)] bg-white p-3">
+                    {h5QrDataUrl ? (
+                      <img
+                        src={h5QrDataUrl}
+                        alt={t('settings.general.h5AccessQrAlt')}
+                        className="h-full w-full"
+                      />
+                    ) : (
+                      <QrCode className="h-12 w-12 text-neutral-400" aria-hidden="true" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-medium uppercase text-[var(--color-text-tertiary)]">
+                      {t('settings.general.h5AccessQrTitle')}
+                    </div>
+                    <p className="mt-1 text-xs leading-5 text-[var(--color-text-tertiary)]">
+                      {h5GeneratedToken
+                        ? t('settings.general.h5AccessQrHint')
+                        : t('settings.general.h5AccessQrRefreshHint')}
+                    </p>
+                    {h5LaunchUrl && (
+                      <div className="mt-3 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-text-primary)] break-all">
+                        {h5LaunchUrl}
+                      </div>
+                    )}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        icon={<Copy className="h-3.5 w-3.5" aria-hidden="true" />}
+                        disabled={!h5LaunchUrl || !h5GeneratedToken}
+                        onClick={() => void handleH5LaunchUrlCopy()}
+                      >
+                        {t('settings.general.h5AccessCopyLaunchUrl')}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        icon={<RotateCw className="h-3.5 w-3.5" aria-hidden="true" />}
+                        loading={h5ActionRunning}
+                        onClick={() => void handleH5Regenerate()}
+                      >
+                        {t('settings.general.h5AccessRegenerate')}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {h5Access.enabled && (
+              <div className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium uppercase text-[var(--color-text-tertiary)]">
+                      {t('settings.general.h5AccessTokenPreview')}
+                    </div>
+                    <div className="mt-1 break-all text-sm text-[var(--color-text-primary)]">
+                      {h5TokenVisible && h5GeneratedToken
+                        ? h5GeneratedToken
+                        : h5Access.tokenPreview || t('settings.general.h5AccessTokenNotAvailable')}
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 flex-wrap justify-end gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      icon={h5TokenVisible ? <EyeOff className="h-3.5 w-3.5" aria-hidden="true" /> : <Eye className="h-3.5 w-3.5" aria-hidden="true" />}
+                      disabled={!h5GeneratedToken}
+                      onClick={() => setH5TokenVisible((visible) => !visible)}
+                    >
+                      {h5TokenVisible ? t('settings.general.h5AccessHideToken') : t('settings.general.h5AccessShowToken')}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="danger"
+                      icon={<PowerOff className="h-3.5 w-3.5" aria-hidden="true" />}
+                      loading={h5ActionRunning}
+                      onClick={() => void handleH5Disable()}
+                    >
+                      {t('settings.general.h5AccessDisable')}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <p className="mt-4 text-xs text-[var(--color-text-tertiary)] leading-5">
+              {t('settings.general.h5AccessSafetyNote')}
+            </p>
+            {h5AccessError && (
+              <p className="mt-2 text-xs text-[var(--color-error)]">
+                {h5AccessError}
+              </p>
+            )}
+          </div>
+        </section>
+      </div>
+
+      <ConfirmDialog
+        open={h5EnableConfirmOpen}
+        onClose={() => {
+          if (!h5ActionRunning) setH5EnableConfirmOpen(false)
+        }}
+        onConfirm={handleH5EnableConfirm}
+        title={t('settings.general.h5AccessConfirmTitle')}
+        body={t('settings.general.h5AccessConfirmBody')}
+        confirmLabel={t('settings.general.h5AccessConfirmEnable')}
+        cancelLabel={t('common.cancel')}
+        confirmVariant="danger"
+        loading={h5ActionRunning}
+      />
     </div>
+  )
+}
+
+function SettingsCheckboxMark({ checked, disabled = false }: { checked: boolean; disabled?: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-all peer-focus-visible:ring-2 peer-focus-visible:ring-[var(--color-brand)]/40 ${
+        checked
+          ? 'border-[var(--color-brand)] bg-[var(--color-brand)] text-white shadow-[var(--shadow-button-primary)]'
+          : 'border-[var(--color-border-focus)] bg-[var(--color-surface)] text-transparent'
+      } ${disabled ? 'opacity-50' : ''}`}
+    >
+      <span className="material-symbols-outlined text-[16px] leading-none" style={{ fontVariationSettings: "'FILL' 1" }}>
+        check
+      </span>
+    </span>
   )
 }
 
